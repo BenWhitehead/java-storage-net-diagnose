@@ -1,8 +1,15 @@
 # java-storage-net-diagnose
 
 ## Prerequisites
+
+### Java
 1. jdk 11+
 2. maven 3.x
+
+### Cloud Permissions
+1. `storage.buckets.get`
+2. `storage.objects.get`
+3. `compute.subnetworks.list`
 
 ## Build
 ```

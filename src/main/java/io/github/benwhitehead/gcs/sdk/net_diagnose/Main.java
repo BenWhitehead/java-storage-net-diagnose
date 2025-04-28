@@ -5,9 +5,11 @@ import com.google.cloud.compute.v1.Subnetwork;
 import com.google.cloud.compute.v1.SubnetworksClient;
 import com.google.cloud.compute.v1.SubnetworksClient.ListPagedResponse;
 import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobReadSession;
 import com.google.cloud.storage.Bucket;
 import com.google.cloud.storage.GrpcStorageOptions;
 import com.google.cloud.storage.HttpStorageOptions;
+import com.google.cloud.storage.ReadProjectionConfigs;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.Storage.BucketField;
 import com.google.cloud.storage.Storage.BucketGetOption;
@@ -16,6 +18,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.io.ByteStreams;
 import java.io.IOException;
 import java.nio.channels.Channels;
+import java.nio.channels.ScatteringByteChannel;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -24,6 +27,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
@@ -39,6 +44,23 @@ public final class Main {
   private static final Logger LOGGER = LoggerFactory.getLogger(Main.class);
 
   private static final double NANOS_PER_SECOND = Duration.ofSeconds(1).toNanos();
+  private static final BiConsumer<Storage, BlobId> readChannel = (s, id) -> {
+    try (ReadChannel reader = s.reader(id)) {
+      reader.setChunkSize(0);
+      ByteStreams.copy(reader, Channels.newChannel(ByteStreams.nullOutputStream()));
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  };
+  private static final BiConsumer<Storage, BlobId> blobReadSessionChannel = (s, id) -> {
+    try (BlobReadSession session = s.blobReadSession(id).get(5, TimeUnit.SECONDS)) {
+      try (ScatteringByteChannel reader = session.readAs(ReadProjectionConfigs.asChannel())) {
+        ByteStreams.copy(reader, Channels.newChannel(ByteStreams.nullOutputStream()));
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  };
 
   @SuppressWarnings("OptionalGetWithoutIsPresent")
   public static void main(String[] args) throws Exception {
@@ -92,7 +114,9 @@ public final class Main {
         LOGGER.info("bucket.storageClass = {}", bucket.getStorageClass());
 
         LOGGER.info("--- JSON ----------------------");
-        runForStorageInstance(storage, id);
+        runForStorageInstance(storage, id, readChannel);
+      } catch (Exception e) {
+        LOGGER.warn("Error while probing via JSON", e);
       }
     }
 
@@ -103,8 +127,10 @@ public final class Main {
           .setAttemptDirectPath(false)
           .build();
       try (Storage storage = options.getService()) {
-        LOGGER.info("--- gRPC+CFE ------------------");
-        runForStorageInstance(storage, id);
+        LOGGER.info("--- gRPC+CFE (ReadObject) -----");
+        runForStorageInstance(storage, id, readChannel);
+      } catch (Exception e) {
+        LOGGER.warn("Error while probing via gRPC+CFE", e);
       }
     }
 
@@ -114,22 +140,34 @@ public final class Main {
           .setGrpcInterceptorProvider(() -> ImmutableList.of(new RemoteAddrLoggingInterceptor()))
           .build();
       try (Storage storage = options.getService()) {
-        LOGGER.info("--- gRPC+DP -------------------");
-        runForStorageInstance(storage, id);
+        LOGGER.info("--- gRPC+DP (ReadObject) ------");
+        runForStorageInstance(storage, id, readChannel);
+      } catch (Exception e) {
+        LOGGER.warn("Error while probing via gRPC+DP", e);
+      }
+    }
+
+    {
+      now();
+      GrpcStorageOptions options = StorageOptions.grpc()
+          .setGrpcInterceptorProvider(() -> ImmutableList.of(new RemoteAddrLoggingInterceptor()))
+          .build();
+      try (Storage storage = options.getService()) {
+        LOGGER.info("--- gRPC+DP (BidiReadObject) --");
+        runForStorageInstance(storage, id, blobReadSessionChannel);
+      } catch (Exception e) {
+        LOGGER.warn("Error while probing via gRPC+DP", e);
       }
     }
     now();
     LOGGER.info("\n\n");
   }
 
-  private static void runForStorageInstance(Storage storage, BlobId id) throws IOException {
+  private static void runForStorageInstance(Storage storage, BlobId id, BiConsumer<Storage, BlobId> c) {
     DescriptiveStatistics latencyStats = new DescriptiveStatistics();
     for (int i = 1; i <= 5; i++) {
       long begin = System.nanoTime();
-      try (ReadChannel reader = storage.reader(id)) {
-        reader.setChunkSize(0);
-        ByteStreams.copy(reader, Channels.newChannel(ByteStreams.nullOutputStream()));
-      }
+      c.accept(storage, id);
       long end = System.nanoTime();
       long delta = end - begin;
       double seconds = delta / NANOS_PER_SECOND;

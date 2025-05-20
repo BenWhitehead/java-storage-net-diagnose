@@ -1,9 +1,24 @@
 package io.github.benwhitehead.gcs.sdk.net_diagnose;
 
+import com.google.api.gax.rpc.PermissionDeniedException;
 import com.google.cloud.ReadChannel;
+import com.google.cloud.compute.v1.Firewall;
+import com.google.cloud.compute.v1.FirewallsClient;
+import com.google.cloud.compute.v1.GetNetworkRequest;
+import com.google.cloud.compute.v1.ListFirewallsRequest;
+import com.google.cloud.compute.v1.ListSubnetworksRequest;
+import com.google.cloud.compute.v1.Network;
+import com.google.cloud.compute.v1.NetworksClient;
 import com.google.cloud.compute.v1.Subnetwork;
 import com.google.cloud.compute.v1.SubnetworksClient;
 import com.google.cloud.compute.v1.SubnetworksClient.ListPagedResponse;
+import com.google.cloud.resourcemanager.v3.FoldersClient;
+import com.google.cloud.resourcemanager.v3.GetProjectRequest;
+import com.google.cloud.resourcemanager.v3.Organization;
+import com.google.cloud.resourcemanager.v3.OrganizationsClient;
+import com.google.cloud.resourcemanager.v3.Project;
+import com.google.cloud.resourcemanager.v3.ProjectName;
+import com.google.cloud.resourcemanager.v3.ProjectsClient;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobReadSession;
 import com.google.cloud.storage.Bucket;
@@ -16,16 +31,28 @@ import com.google.cloud.storage.Storage.BucketGetOption;
 import com.google.cloud.storage.StorageOptions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.io.ByteStreams;
+import com.google.identity.accesscontextmanager.v1.AccessContextManagerClient;
+import com.google.identity.accesscontextmanager.v1.AccessContextManagerClient.ListAccessPoliciesPagedResponse;
+import com.google.identity.accesscontextmanager.v1.AccessContextManagerClient.ListServicePerimetersPagedResponse;
+import com.google.identity.accesscontextmanager.v1.AccessPolicy;
+import com.google.identity.accesscontextmanager.v1.ListAccessPoliciesRequest;
+import com.google.identity.accesscontextmanager.v1.ListServicePerimetersRequest;
+import com.google.identity.accesscontextmanager.v1.ServicePerimeter;
+import com.google.protobuf.Message;
+import com.google.protobuf.TextFormat;
+import com.google.protobuf.TextFormat.Printer;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ScatteringByteChannel;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
@@ -42,6 +69,7 @@ public final class Main {
     org.slf4j.bridge.SLF4JBridgeHandler.install();
   }
   private static final Logger LOGGER = LoggerFactory.getLogger(Main.class);
+  public static final Printer PRINTER = TextFormat.printer();
 
   private static final double NANOS_PER_SECOND = Duration.ofSeconds(1).toNanos();
   private static final BiConsumer<Storage, BlobId> readChannel = (s, id) -> {
@@ -71,30 +99,27 @@ public final class Main {
       System.exit(1);
     }
 
-    LOGGER.info("env.GOOGLE_APPLICATION_CREDENTIALS = {}", System.getenv("GOOGLE_APPLICATION_CREDENTIALS"));
-    TreeMap<String, String> properties = new TreeMap<>();
-    System.getProperties().forEach((k, v) -> properties.put((String) k, (String) v));
-    for (Entry<String, String> e : properties.entrySet()) {
-      LOGGER.info("-D{}={}", e.getKey(), StringEscapeUtils.escapeJava(e.getValue()));
-    }
+    reportEnvVar("CLOUDSDK_CONFIG");
+    reportEnvVar("GOOGLE_APPLICATION_CREDENTIALS");
+    reportJavaSystemProperties();
     MDS.all(LOGGER::info);
 
-    try (SubnetworksClient sub = SubnetworksClient.create()) {
-      String projectNumber = MDS.projectNumber().get();
-      String zone = MDS.zone().get();
-      String region = zone.substring(zone.lastIndexOf("/") + 1, zone.lastIndexOf("-"));
-      ListPagedResponse list = sub.list(projectNumber, region);
-      List<Subnetwork> all = StreamSupport.stream(list.iterateAll().spliterator(), false)
-          .collect(Collectors.toList());
-      for (int i = 0; i < all.size(); i++) {
-        Subnetwork subnetwork = all.get(i);
-        log(String.format(Locale.US, "subnetwork[%d]", i), subnetwork);
-      }
-    }
+    reportSubnetworks();
+    reportPerimeter();
 
     BlobId id = BlobId.fromGsUtilUri(args[0]);
     LOGGER.info("gsutil_uri = {}", id.toGsUtilUriWithGeneration());
 
+    reportGcsObject(id);
+    now();
+    LOGGER.info("\n\n");
+  }
+
+  private static void reportEnvVar(String var) {
+    LOGGER.info("env.{} = {}", var, System.getenv(var));
+  }
+
+  private static void reportGcsObject(BlobId id) {
     {
       now();
       HttpStorageOptions options = StorageOptions.http().build();
@@ -159,8 +184,155 @@ public final class Main {
         LOGGER.warn("Error while probing via gRPC+DP", e);
       }
     }
-    now();
-    LOGGER.info("\n\n");
+  }
+
+  @SuppressWarnings("OptionalGetWithoutIsPresent")
+  private static void reportSubnetworks() throws IOException {
+    logPde("Error while attempting to probe subnetwork configuration", () -> {
+      try (
+          NetworksClient net = NetworksClient.create();
+          SubnetworksClient sub = SubnetworksClient.create();
+          FirewallsClient firewalls = FirewallsClient.create()
+      ) {
+        String projectNumber = MDS.projectNumber().get();
+        String zone = MDS.zone().get();
+        String region = zone.substring(zone.lastIndexOf("/") + 1, zone.lastIndexOf("-"));
+
+        List<String> networks = new ArrayList<>();
+        {
+          int i = 0;
+          while (true) {
+            String path = "/computeMetadata/v1/instance/network-interfaces/" + i + "/network";
+            Optional<String> got = MDS.get(path);
+            if (got.isPresent()) {
+              networks.add(got.get());
+            } else {
+              break;
+            }
+            i++;
+          }
+        }
+
+        for (int i = 0; i < networks.size(); i++) {
+          String networkResourceName = networks.get(i);
+          String networkName = networkResourceName.substring(networkResourceName.lastIndexOf("/") + 1);
+          GetNetworkRequest nReq = GetNetworkRequest.newBuilder()
+              .setProject(projectNumber)
+              .setNetwork(networkName)
+              .build();
+          Network network = net.get(nReq);
+
+          String networkPrefix = String.format(Locale.US, "network[%d]", i);
+          log(networkPrefix, network);
+
+          {
+            ListFirewallsRequest lfReq = ListFirewallsRequest.newBuilder()
+                .setProject(projectNumber)
+                // mimic what compute firewall-rules list --filter='network=default' does
+                // use eq instead of =
+                // wrap the search term in a regex
+                .setFilter(String.format(Locale.US, "network eq \".*\\b%s\\b.*\"", networkName))
+                .build();
+            FirewallsClient.ListPagedResponse list = firewalls.list(lfReq);
+            List<Firewall> all = StreamSupport.stream(list.iterateAll().spliterator(), false)
+                .collect(Collectors.toList());
+            for (int j = 0; j < all.size(); j++) {
+              Firewall firewall = all.get(j);
+              log(String.format(Locale.US, "%s.firewall[%d]", networkPrefix, j), firewall);
+            }
+          }
+
+          // report subnetworks
+          {
+            ListSubnetworksRequest lsReq = ListSubnetworksRequest.newBuilder()
+                .setProject(projectNumber)
+                .setRegion(region)
+                .setFilter(String.format(Locale.US, "name=%s", networkName))
+                .build();
+            ListPagedResponse list = sub.list(lsReq);
+            List<Subnetwork> all = StreamSupport.stream(list.iterateAll().spliterator(), false)
+                .collect(Collectors.toList());
+            for (int j = 0; j < all.size(); j++) {
+              Subnetwork subnetwork = all.get(j);
+              log(String.format(Locale.US, "%s.subnetwork[%d]", networkPrefix, j), subnetwork);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  private static void reportPerimeter() throws IOException {
+    logPde("Error while attempting to probe project and org access policy configuration", () -> {
+      try (
+          AccessContextManagerClient acm = AccessContextManagerClient.create();
+          ProjectsClient projects = ProjectsClient.create();
+          FoldersClient folders = FoldersClient.create();
+          OrganizationsClient orgs = OrganizationsClient.create()
+      ) {
+        GetProjectRequest pReq = GetProjectRequest.newBuilder()
+            .setName(ProjectName.format(MDS.projectNumber().get()))
+            .build();
+        Project project = projects.getProject(pReq);
+        log(String.format(Locale.US, "project"), project);
+        String orgid;
+        if (project.getParent().startsWith("organizations/")) {
+          orgid = project.getParent();
+        } else {
+          // TODO: walk up folder
+          throw new IllegalStateException("Unable to traverse project folders at this time");
+        }
+        logPde("Error attempting to prob organization configuration", () -> {
+          // resourcemanager.organizations.get
+          Organization organization = orgs.getOrganization(orgid);
+          log("organization", organization);
+        });
+        ListAccessPoliciesRequest apReq = ListAccessPoliciesRequest.newBuilder()
+            .setParent(orgid)
+            .build();
+        ListAccessPoliciesPagedResponse apPage = acm.listAccessPolicies(apReq);
+        List<AccessPolicy> apAll = StreamSupport.stream(apPage.iterateAll().spliterator(), false)
+            .collect(Collectors.toList());
+
+        for (int i = 0; i < apAll.size(); i++) {
+          AccessPolicy ap = apAll.get(i);
+          String apPrefix = String.format(Locale.US, "accessPolicies[%d]", i);
+          log(apPrefix, ap);
+          ListServicePerimetersRequest spReq = ListServicePerimetersRequest.newBuilder()
+              .setParent(ap.getName())
+              .build();
+          ListServicePerimetersPagedResponse spPage = acm.listServicePerimetersPagedCallable()
+              .call(spReq);
+          List<ServicePerimeter> spAll = StreamSupport.stream(spPage.iterateAll().spliterator(), false)
+              .collect(Collectors.toList());
+          for (int j = 0; j < spAll.size(); j++) {
+            ServicePerimeter perimeter = spAll.get(j);
+            log(String.format(Locale.US, "%s.perimeter[%d]", apPrefix, j), perimeter);
+          }
+        }
+      }
+    });
+  }
+
+  @FunctionalInterface
+  interface ERunnable<E extends Exception> {
+    void run() throws E;
+  }
+
+  private static <E extends Exception> void logPde(String description, ERunnable<E> r)  throws E {
+    try {
+      r.run();
+    } catch (PermissionDeniedException pde) {
+      LOGGER.warn("{}: {}", description, pde.getCause().getMessage());
+    }
+  }
+
+  private static void reportJavaSystemProperties() {
+    TreeMap<String, String> properties = new TreeMap<>();
+    System.getProperties().forEach((k, v) -> properties.put((String) k, (String) v));
+    for (Entry<String, String> e : properties.entrySet()) {
+      LOGGER.info("-D{}={}", e.getKey(), StringEscapeUtils.escapeJava(e.getValue()));
+    }
   }
 
   private static void runForStorageInstance(Storage storage, BlobId id, BiConsumer<Storage, BlobId> c) {
@@ -185,22 +357,18 @@ public final class Main {
   private static void now() {
     LOGGER.info("{}", Instant.now().atOffset(ZoneOffset.UTC));
   }
-  
-  private static void log(String prefix, Subnetwork subnetwork) {
-    LOGGER.info("{}.creationTimestamp: {}",        prefix, subnetwork.getCreationTimestamp());
-    LOGGER.info("{}.fingerprint: {}",              prefix, subnetwork.getFingerprint());
-    LOGGER.info("{}.gatewayAddress: {}",           prefix, subnetwork.getGatewayAddress());
-    LOGGER.info("{}.id: {}",                       prefix, subnetwork.getId());
-    LOGGER.info("{}.ipCidrRange: {}",              prefix, subnetwork.getIpCidrRange());
-    LOGGER.info("{}.ipv6CidrRange: {}",            prefix, subnetwork.getIpv6CidrRange());
-    LOGGER.info("{}.kind: {}",                     prefix, subnetwork.getKind());
-    LOGGER.info("{}.name: {}",                     prefix, subnetwork.getName());
-    LOGGER.info("{}.network: {}",                  prefix, subnetwork.getNetwork());
-    LOGGER.info("{}.privateIpGoogleAccess: {}",    prefix, subnetwork.getPrivateIpGoogleAccess());
-    LOGGER.info("{}.privateIpv6GoogleAccess: {}",  prefix, subnetwork.getPrivateIpv6GoogleAccess());
-    LOGGER.info("{}.purpose: {}",                  prefix, subnetwork.getPurpose());
-    LOGGER.info("{}.region: {}",                   prefix, subnetwork.getRegion());
-    LOGGER.info("{}.selfLink: {}",                 prefix, subnetwork.getSelfLink());
-    LOGGER.info("{}.stackType: {}",                prefix, subnetwork.getStackType());
+
+  private static void log(String prefix, Message perimeter) {
+    String[] lines = PRINTER.printToString(perimeter).split("\n");
+    for (int i = 0; i < lines.length; i++) {
+      String line = lines[i];
+      if (i == 0) {
+        LOGGER.info("{}: {", prefix);
+      }
+      LOGGER.info("   {}", line);
+      if (i == lines.length - 1) {
+        LOGGER.info("}");
+      }
+    }
   }
 }

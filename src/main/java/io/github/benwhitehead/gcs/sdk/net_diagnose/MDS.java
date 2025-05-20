@@ -102,7 +102,7 @@ final class MDS {
       HttpResponse resp = req.execute();
       try (InputStream content = resp.getContent();
           Reader r = new InputStreamReader(content)) {
-        return CharStreams.readLines(r).stream().sorted().collect(ImmutableList.toImmutableList());
+        return CharStreams.readLines(r).stream().collect(ImmutableList.toImmutableList());
       }
     } catch (HttpResponseException e) {
       return ImmutableList.of();

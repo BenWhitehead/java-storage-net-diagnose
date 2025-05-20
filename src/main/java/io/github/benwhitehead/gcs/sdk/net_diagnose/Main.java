@@ -60,6 +60,7 @@ import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
 import org.apache.commons.text.StringEscapeUtils;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -155,7 +156,7 @@ public final class Main {
         LOGGER.info("--- gRPC+CFE (ReadObject) -----");
         runForStorageInstance(storage, id, readChannel);
       } catch (Exception e) {
-        LOGGER.warn("Error while probing via gRPC+CFE", e);
+        LOGGER.warn("Error while probing via gRPC+CFE via ReadObject API", e);
       }
     }
 
@@ -168,11 +169,11 @@ public final class Main {
         LOGGER.info("--- gRPC+DP (ReadObject) ------");
         runForStorageInstance(storage, id, readChannel);
       } catch (Exception e) {
-        LOGGER.warn("Error while probing via gRPC+DP", e);
+        LOGGER.warn("Error while probing via gRPC+DP via ReadObject API", e);
       }
     }
 
-    {
+    logPde("Error while probing via gRPC+DP via BidiReadObject API", () -> {
       now();
       GrpcStorageOptions options = StorageOptions.grpc()
           .setGrpcInterceptorProvider(() -> ImmutableList.of(new RemoteAddrLoggingInterceptor()))
@@ -180,10 +181,12 @@ public final class Main {
       try (Storage storage = options.getService()) {
         LOGGER.info("--- gRPC+DP (BidiReadObject) --");
         runForStorageInstance(storage, id, blobReadSessionChannel);
+      } catch (RuntimeException e) {
+        throw e;
       } catch (Exception e) {
-        LOGGER.warn("Error while probing via gRPC+DP", e);
+        throw new RuntimeException(e);
       }
-    }
+    });
   }
 
   @SuppressWarnings("OptionalGetWithoutIsPresent")
@@ -324,8 +327,29 @@ public final class Main {
       r.run();
     } catch (PermissionDeniedException pde) {
       LOGGER.warn("{}: {}", description, pde.getCause().getMessage());
+    } catch (Throwable t) {
+      PermissionDeniedException cause = findCause(t, PermissionDeniedException.class);
+      if (cause != null) {
+        LOGGER.warn("{}: {}", description, cause.getCause().getMessage());
+        return;
+      }
+      throw t;
     }
   }
+
+  @Nullable
+  private static <T extends Throwable, C extends Class<T>> T findCause(Throwable t, C c) {
+    if (t == null) {
+      return null;
+    }
+
+    if (c.isAssignableFrom(t.getClass())) {
+      return c.cast(t);
+    } else {
+      return findCause(t.getCause(), c);
+    }
+  }
+
 
   private static void reportJavaSystemProperties() {
     TreeMap<String, String> properties = new TreeMap<>();

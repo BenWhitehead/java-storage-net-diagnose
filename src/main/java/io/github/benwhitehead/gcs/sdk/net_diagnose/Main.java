@@ -396,6 +396,7 @@ public final class Main {
       GoogleJsonResponseException gjre = findCause(t, GoogleJsonResponseException.class);
       if (gjre != null && gjre.getStatusCode() == 403) {
         LOGGER.warn("{}: {}", description, gjre.getMessage());
+        return;
       }
       throw t;
     }

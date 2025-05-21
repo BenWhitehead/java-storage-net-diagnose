@@ -48,6 +48,10 @@
       <groupId>com.google.cloud</groupId>
       <artifactId>google-cloud-resourcemanager</artifactId>
     </dependency>
+    <dependency>
+      <groupId>com.google.cloud</groupId>
+      <artifactId>google-cloud-dns</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.slf4j</groupId>

@@ -1,6 +1,16 @@
 package io.github.benwhitehead.gcs.sdk.net_diagnose;
 
+import com.google.api.client.http.HttpRequestInitializer;
+import com.google.api.client.http.HttpTransport;
+import com.google.api.client.json.GenericJson;
+import com.google.api.client.json.jackson2.JacksonFactory;
 import com.google.api.gax.rpc.PermissionDeniedException;
+import com.google.api.services.dns.Dns;
+import com.google.api.services.dns.model.ManagedZone;
+import com.google.api.services.dns.model.ManagedZonePrivateVisibilityConfig;
+import com.google.api.services.dns.model.ManagedZonesListResponse;
+import com.google.api.services.dns.model.ResourceRecordSet;
+import com.google.api.services.dns.model.ResourceRecordSetsListResponse;
 import com.google.cloud.ReadChannel;
 import com.google.cloud.compute.v1.Firewall;
 import com.google.cloud.compute.v1.FirewallsClient;
@@ -12,6 +22,8 @@ import com.google.cloud.compute.v1.NetworksClient;
 import com.google.cloud.compute.v1.Subnetwork;
 import com.google.cloud.compute.v1.SubnetworksClient;
 import com.google.cloud.compute.v1.SubnetworksClient.ListPagedResponse;
+import com.google.cloud.dns.DnsOptions;
+import com.google.cloud.http.HttpTransportOptions;
 import com.google.cloud.resourcemanager.v3.FoldersClient;
 import com.google.cloud.resourcemanager.v3.GetProjectRequest;
 import com.google.cloud.resourcemanager.v3.Organization;
@@ -260,6 +272,53 @@ public final class Main {
               log(String.format(Locale.US, "%s.subnetwork[%d]", networkPrefix, j), subnetwork);
             }
           }
+
+          // report dns-zones
+          {
+            DnsOptions options = DnsOptions.getDefaultInstance();
+            HttpTransportOptions transportOptions = (HttpTransportOptions) options.getTransportOptions();
+            HttpTransport transport = transportOptions.getHttpTransportFactory().create();
+            HttpRequestInitializer initializer = transportOptions.getHttpRequestInitializer(options);
+            Dns dns = new Dns.Builder(transport, new JacksonFactory(), initializer)
+                .setRootUrl(options.getHost())
+                .setApplicationName(options.getApplicationName())
+                .build();
+
+            String npt;
+            int jj = 0;
+            do {
+              ManagedZonesListResponse zones = dns.managedZones().list(projectNumber).execute();
+              npt = zones.getNextPageToken();
+
+              List<ManagedZone> managedZones = zones.getManagedZones();
+              for (ManagedZone mz : managedZones) {
+                boolean anyMatch = Optional.ofNullable(mz.getPrivateVisibilityConfig())
+                    .map(ManagedZonePrivateVisibilityConfig::getNetworks)
+                    .stream()
+                    .flatMap(List::stream)
+                    .anyMatch(n -> n.getNetworkUrl().contains(networkName));
+                if (anyMatch) {
+                  String mzPrefix = String.format(Locale.US, "%s.dns-managed-zone[%d]",
+                      networkPrefix, jj++);
+                  log(mzPrefix, mz);
+
+                  String rrsNpt;
+                  int k = 0;
+                  do {
+                    ResourceRecordSetsListResponse rrsList = dns.resourceRecordSets()
+                        .list(projectNumber, mz.getName())
+                        .execute();
+                    rrsNpt = rrsList.getNextPageToken();
+                    for (int l = 0; l < rrsList.getRrsets().size(); k++, l++) {
+                      ResourceRecordSet rrs = rrsList.getRrsets().get(k);
+                      String rrsPrefix = String.format(Locale.US, "%s.rrs[%d]", mzPrefix, k);
+                      log(rrsPrefix, rrs);
+                    }
+                  } while (rrsNpt != null);
+                }
+              }
+            } while (npt != null);
+          }
         }
       }
     });
@@ -277,7 +336,7 @@ public final class Main {
             .setName(ProjectName.format(MDS.projectNumber().get()))
             .build();
         Project project = projects.getProject(pReq);
-        log(String.format(Locale.US, "project"), project);
+        log("project", project);
         String orgid;
         if (project.getParent().startsWith("organizations/")) {
           orgid = project.getParent();
@@ -382,8 +441,17 @@ public final class Main {
     LOGGER.info("{}", Instant.now().atOffset(ZoneOffset.UTC));
   }
 
-  private static void log(String prefix, Message perimeter) {
-    String[] lines = PRINTER.printToString(perimeter).split("\n");
+  private static void log(String prefix, Message message) {
+    String[] lines = PRINTER.printToString(message).split("\n");
+    logLines(prefix, lines);
+  }
+
+  private static void log(String prefix, GenericJson message) throws IOException {
+    String[] lines = message.toPrettyString().split("\n");
+    logLines(prefix, lines);
+  }
+
+  private static void logLines(String prefix, String[] lines) {
     for (int i = 0; i < lines.length; i++) {
       String line = lines[i];
       if (i == 0) {

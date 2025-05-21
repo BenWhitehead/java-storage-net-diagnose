@@ -1,5 +1,6 @@
 package io.github.benwhitehead.gcs.sdk.net_diagnose;
 
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.http.HttpRequestInitializer;
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.json.GenericJson;
@@ -391,6 +392,10 @@ public final class Main {
       if (cause != null) {
         LOGGER.warn("{}: {}", description, cause.getCause().getMessage());
         return;
+      }
+      GoogleJsonResponseException gjre = findCause(t, GoogleJsonResponseException.class);
+      if (gjre != null && gjre.getStatusCode() == 403) {
+        LOGGER.warn("{}: {}", description, gjre.getMessage());
       }
       throw t;
     }
